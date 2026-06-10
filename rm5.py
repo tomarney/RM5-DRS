@@ -1131,7 +1131,6 @@ def settingsWidget():
     caComboBox = QtGui.QComboBox(widget)
     caComboBox.addItems(caChannels)
     caComboBox.setCurrentText(settings["CaChannel"])
-    caComboBox.currentTextChanged.connect(lambda t: drs.setSetting("CaChannel", t))
     ecGroupLayout.addWidget(caComboBox)
 
     # Push everything to the left
@@ -1782,9 +1781,10 @@ def settingsWidget():
         RMsListWidget.blockSignals(False)
         refreshPlot()
 
-    def on_elements_changed(selected):
-        drs.setSetting("Elements", selected)
-        elButton.setText(f"Elements ({len(selected)} selected)")
+    def updateRatioCombo():
+        """Update the El/Ca selection combobox using the current settings"""
+        selected_els = drs.setting("Elements")
+        ca_channel = drs.setting("CaChannel")
 
         # Re-populate Ratio combo, keeping selection if possible
         old_sel = ratioPlotCombo.currentData
@@ -1793,9 +1793,9 @@ def settingsWidget():
 
         ratioPlotCombo.blockSignals(True)
         ratioPlotCombo.clear()
-        for el in selected:
+        for el in selected_els:
             # Display: Li7/Ca43, Data: Li7
-            ratioPlotCombo.addItem(f"{el}/{caComboBox.currentText}", el)
+            ratioPlotCombo.addItem(f"{el}/{ca_channel}", el)
 
         # Restore old selection
         idx = ratioPlotCombo.findData(old_sel)
@@ -1805,7 +1805,19 @@ def settingsWidget():
             ratioPlotCombo.setCurrentIndex(0)
 
         ratioPlotCombo.blockSignals(False)
+
+    def on_elements_changed(selected):
+        drs.setSetting("Elements", selected)
+        elButton.setText(f"Elements ({len(selected)} selected)")
+        updateRatioCombo()        
         updateRMListForRatio()
+    
+    def on_Ca_channel_changed(new_Ca_channel):
+        drs.setSetting("CaChannel", new_Ca_channel)
+        selected_els = drs.setting("Elements")
+        calc_raw_ratios(new_Ca_channel, selected_els, data.timeSeries(drs.setting("IndexChannel")))
+        updateRatioCombo()
+        refreshPlot()        
 
     def on_rm_checked_changed(item):
         save_current_rm_selection()
@@ -1817,7 +1829,7 @@ def settingsWidget():
     ratioPlotCombo.currentIndexChanged.connect(updateRMListForRatio)
     ratioViewCombo.currentIndexChanged.connect(refreshPlot)
     RMsListWidget.itemChanged.connect(on_rm_checked_changed)
-    caComboBox.currentTextChanged.connect(refreshPlot)
+    caComboBox.currentTextChanged.connect(on_Ca_channel_changed)
 
     # Init state
     try:
