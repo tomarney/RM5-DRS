@@ -86,7 +86,6 @@ class RMBlock:
         self.main_sel = main_sel
         self.main_rm_group = main_rm_group
         self.rm_sels = rm_sels
-        self.fits = {}
 
     def __repr__(self):
         return f"RMBlock(t={self.time:.1f}s, main_rm={self.main_rm_group}, n_rms={len(self.rm_sels)})"
@@ -773,6 +772,32 @@ def construct_rm_blocks(main_rm_sels, all_rm_sels, rm_group_names):
     return blocks
 
 
+def find_rm_blocks():
+    """
+    Detect the RM blocks (standards blocks in a standard-sample-bracketing protocol).
+
+    Returns the constructed RM blocks, or None if block detection/building fails.
+    """
+    main_anchor_sel, main_anchor_group = find_first_rm_block()
+    if main_anchor_sel is None:
+        return None
+
+    all_rm_sels = collect_all_rm_selections()
+    rm_group_names = data.selectionGroupNames(data.ReferenceMaterial)
+
+    main_rm_group = data.selectionGroup(main_anchor_group)
+    main_rm_sels = sorted(
+        list(main_rm_group.selections()),
+        key=lambda s: s.midTimestamp if not s.isLinked() else s.linkedMidTimestamp(),
+    )
+
+    blocks = construct_rm_blocks(main_rm_sels, all_rm_sels, rm_group_names)
+    if not blocks:
+        return None
+
+    return blocks
+
+
 # ************************************
 # Main coordinating function
 # ************************************
@@ -844,30 +869,14 @@ def runDRS():
     # ===========================
     drs.message("Detecting standard-sample brackets")
 
-    main_anchor_sel, main_anchor_group = find_first_rm_block()
-    if main_anchor_sel is None:
-        drs_complete(
-            error=True, error_message="Could not detect RM block. Check selections."
-        )
-        return
-
-    all_rm_sels = collect_all_rm_selections()
-    rm_group_names = data.selectionGroupNames(data.ReferenceMaterial)
-
-    main_rm_group = data.selectionGroup(main_anchor_group)
-    main_rm_sels = sorted(
-        list(main_rm_group.selections()),
-        key=lambda s: s.midTimestamp if not s.isLinked() else s.linkedMidTimestamp(),
-    )
-
-    blocks = construct_rm_blocks(main_rm_sels, all_rm_sels, rm_group_names)
+    blocks = find_rm_blocks()
     if not blocks:
         drs_complete(
             error=True, error_message="Could not build RM blocks. Check selections."
         )
         return
 
-    IoLog.information(f"Built {len(blocks)} RM blocks from {main_anchor_group}.")
+    IoLog.information(f"Built {len(blocks)} RM blocks from {blocks[0].main_rm_group}.")
 
     #
     # Step 5: Fit regressions
@@ -875,14 +884,12 @@ def runDRS():
     drs.progress(60)
     drs.message("Fitting regressions to each standards block")
 
-    min_rms = drs.setting("MinRMsPerBlock")
-    rm_selections = drs.setting("RMSelections")
     regr_results = fit_regressions_for_all_blocks(
         blocks,
         elements,
         ca_channel,
-        min_rms_per_block=min_rms,
-        rm_selections=rm_selections,
+        min_rms_per_block=drs.setting("MinRMsPerBlock"),
+        rm_selections=drs.setting("RMSelections"),
     )
     if not regr_results:
         drs_complete(
@@ -1334,26 +1341,9 @@ def settingsWidget():
             PLOT.replot()
             return
 
-        main_anchor_sel, main_anchor_group = find_first_rm_block()
-        if main_anchor_sel is None:
-            IoLog.error(
-                "Block detection failed. Check selection groups and RM ordering."
-            )
-            return
-
-        # Get all RM selections and build blocks
-        all_rm_sels = collect_all_rm_selections()
-        rm_group_names = data.selectionGroupNames(data.ReferenceMaterial)
-        main_rm_group = data.selectionGroup(main_anchor_group)
-        main_rm_sels = list(main_rm_group.selections())
-        main_rm_sels.sort(
-            key=lambda s: s.midTimestamp if not s.isLinked() else s.linkedMidTimestamp()
-        )
-
-        blocks = construct_rm_blocks(main_rm_sels, all_rm_sels, rm_group_names)
-
+        blocks = find_rm_blocks()
         if not blocks:
-            IoLog.error("Block building failed. Check RM selections and bracketing.")
+            IoLog.error("Block detection failed. Check selection groups and RM ordering.")
             return
 
         # Update view options based on block count
