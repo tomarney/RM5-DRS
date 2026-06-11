@@ -68,27 +68,23 @@ PLOT_COLOURS = [QColor(r, g, b) for r, g, b in tableau20]
 class RMBlock:
     """
     Represents a block of standards in a standard-sample-standard protocol.
-    Contains a set of RM selections (measurements) to be used for the regression.
-
-    The block defines a "main" or "anchor" RM (around the middle of the block)
-    which is tracked through a session as a proxy for the blocks.
+    Contains RM selections (measurements) to be used for the regression.
+    
+    Each RM can appear multiple times within a block if measurements are contiguous.
     """
 
-    def __init__(self, time, main_sel, main_rm_group, rm_sels):
+    def __init__(self, rm_sels):
         """
         Args:
-            time: float. Midpoint time of main/anchor RM selection
-            main_sel: iolite Selection object. The anchor selection for this block
-            main_rm_group: str. Name of main RM group
-            rm_sels: dict {RM_name: Selection}. Nearest selections from each RM group
+            rm_sels: dict {RM_name: [Selection, ...]}. List of selections for each RM.
         """
-        self.time = time
-        self.main_sel = main_sel
-        self.main_rm_group = main_rm_group
         self.rm_sels = rm_sels
 
     def __repr__(self):
-        return f"RMBlock(t={self.time:.1f}s, main_rm={self.main_rm_group}, n_rms={len(self.rm_sels)})"
+        rm_counts = ", ".join(
+            [f"{name}({len(sels)})" for name, sels in self.rm_sels.items()]
+        )
+        return f"RMBlock({rm_counts})"
 
 
 # --- Initialize Plot object ---
@@ -366,9 +362,11 @@ def fit_regression_for_block(
 ):
     """
     Fit single regression for the element/Ca ratio in one standards block.
+    
+    Requires at least min_rms_per_block *different* RM types in the block.
 
     Args:
-        block: RMBlock object containing all RM Selections in the block
+        block: RMBlock object containing RM Selections (possibly multiple per RM)
         el_name: str. Element name for the ratio (e.g., "Sr88")
         ca_channel_name: str. Calcium channel for the ratio (e.g., "Ca43")
         selected_rms: list of str. Standards to use in the fit (optional)
@@ -376,12 +374,17 @@ def fit_regression_for_block(
     Returns: dict {slope, intercept, r_squared, slope_unc, intercept_unc} or None
     """
     rm_data = []
-    for rm_group_name, sel in block.rm_sels.items():
+    
+    # Iterate over all RM types and their selections in this block
+    for rm_group_name, sel_list in block.rm_sels.items():
         if selected_rms is not None and rm_group_name not in selected_rms:
             continue
-        stats = gather_ratio_stats(el_name, ca_channel_name, selection=sel)
-        if stats:
-            rm_data.append(stats)
+        
+        # Gather stats for each selection of this RM (may be multiple)
+        for sel in sel_list:
+            stats = gather_ratio_stats(el_name, ca_channel_name, selection=sel)
+            if stats:
+                rm_data.append(stats)
 
     if len(rm_data) < 2:
         return None
@@ -432,6 +435,7 @@ def fit_regressions_for_all_blocks(
         selected_rms = rm_selections.get(el_name, []) if rm_selections else None
 
         for block in blocks:
+            # Count unique RM types in this block (after filtering by selected_rms if needed)
             if selected_rms is not None:
                 viable_rms = sum(1 for rm in block.rm_sels.keys() if rm in selected_rms)
             else:
@@ -439,7 +443,7 @@ def fit_regressions_for_all_blocks(
 
             if viable_rms < min_rms_per_block:
                 IoLog.warning(
-                    f"Block at t={block.time:.1f} s has {viable_rms} valid RMs for {el_name}. "
+                    f"Block has {viable_rms} valid RM types for {el_name}. "
                     f"Need at least {min_rms_per_block}. Skipping."
                 )
                 continue
@@ -625,30 +629,14 @@ def apply_secondary_normalisation(
             IoLog.error(f"Error applying secondary normalisation for {ratio_name}: {e}")
 
 
-# --- RM block management ---
-
-
-def collect_all_rm_selections():
+def find_rm_blocks():
     """
-    Collect all selections (measurements) of RMs across the whole session.
-    Returns list of (time, Selection, group_name) tuples sorted by time.
-    """
-    all_rm_sels = []
-    for rm_name in data.selectionGroupNames(data.ReferenceMaterial):
-        sg = data.selectionGroup(rm_name)
-        if sg:
-            for sel in sg.selections():
-                t = sel.midTimestamp if not sel.isLinked() else sel.linkedMidTimestamp()
-                all_rm_sels.append((t, sel, rm_name))
-    all_rm_sels.sort(key=lambda x: x[0])
-    return all_rm_sels
-
-
-def list_all_selections():
-    """
-    List all iolite data selections, both RM and Sample.
-
-    Returns: list of (time, Selection, group_name, is_rm) tuples sorted by time
+    Build standard blocks by detecting contiguous runs of RMs.
+    
+    A block is a contiguous sequence of RM measurements (can be different RMs).
+    Blocks are separated by Samples.
+    
+    Returns: list of RMBlock objects sorted by time, or empty list if no blocks found
     """
     all_sels = []
 
@@ -667,134 +655,36 @@ def list_all_selections():
                 all_sels.append((t, sel, sample_name, False))
 
     all_sels.sort(key=lambda x: x[0])
-    return all_sels
-
-
-def find_first_rm_block():
-    """
-    Find first contiguous RM block
-    Typically at start of the session, before any samples, but not assumed.
-
-    Returns: tuple (main_anchor_sel, main_anchor_group_name) or (None, None)
-    """
-    all_sels = list_all_selections()
-
+    
     if not all_sels:
-        IoLog.error("No selections found in this session.")
-        return None, None
-
-    # Find first contiguous RM block
-    first_rm_block = []
+        return []
+    
+    blocks = []
+    current_block_sels = {}  # {RM_name: [Selection, ...]}
+    
     for t, sel, group_name, is_rm in all_sels:
         if is_rm:
-            first_rm_block.append((t, sel, group_name))
+            # Add this RM measurement to the current block
+            if group_name not in current_block_sels:
+                current_block_sels[group_name] = []
+            current_block_sels[group_name].append(sel)
         else:
-            # a sample
-            if first_rm_block:
-                # we already have some stds in the list, so we can stop looking
-                break
-            # (else) empty list, so the session starts with a sample. Keep looking...
-
-    if not first_rm_block:
-        IoLog.error("No RM block found at start of the session.")
-        return None, None
-
-    # Use middle selection as anchor
-    middle_idx = len(first_rm_block) // 2
-    middle_time, middle_sel, middle_group = first_rm_block[middle_idx]
-
-    IoLog.information(
-        f"Detected first RM block: {len(first_rm_block)} selections, "
-        f"using middle RM {middle_group} as anchor to detect other blocks."
-    )
-
-    return middle_sel, middle_group
-
-
-def find_nearest_rm_selection(anchor_time, rm_group_name, all_rm_sels):
-    """
-    Find the nearest selection of a given standard, relative to a given time in the session.
-
-    Args:
-        anchor_time: float. Reference time to search from (e.g., middle of a RM block)
-        rm_group_name: str. RM group name to search
-        all_rm_sels: list of (time, Selection, group_name) tuples
-
-    Returns: Selection or None
-    """
-    candidates = [sel for t, sel, gn in all_rm_sels if gn == rm_group_name]
-    if not candidates:
-        return None
-
-    times = [t for t, sel, gn in all_rm_sels if gn == rm_group_name]
-    nearest_idx = np.argmin([abs(t - anchor_time) for t in times])
-    return candidates[nearest_idx]
-
-
-def construct_rm_blocks(main_rm_sels, all_rm_sels, rm_group_names):
-    """
-    Build each standard block in a standard-sample-standard bracketing protocol.
-
-    Searches around each anchor/main standard for the nearest occurrence of each of the other RMs
-
-    Args:
-        main_rm_sels: list of Selection objects from main RM (sorted by time)
-        all_rm_sels: list of (time, Selection, group_name) tuples for all RMs
-        rm_group_names: list of all RM group names
-
-    Returns: list of RMBlock objects sorted by time
-    """
-    blocks = []
-
-    for main_sel in main_rm_sels:
-        anchor_time = (
-            main_sel.midTimestamp
-            if not main_sel.isLinked()
-            else main_sel.linkedMidTimestamp()
-        )
-        anchor_group = main_sel.group().name
-
-        rm_sels_dict = {}
-        for rm_group_name in rm_group_names:
-            nearest_sel = find_nearest_rm_selection(
-                anchor_time, rm_group_name, all_rm_sels
-            )
-            if nearest_sel:
-                rm_sels_dict[rm_group_name] = nearest_sel
-
-        if anchor_group not in rm_sels_dict:
-            rm_sels_dict[anchor_group] = main_sel
-
-        block = RMBlock(anchor_time, main_sel, anchor_group, rm_sels_dict)
+            # Sample encountered: end current block if non-empty and start fresh
+            if current_block_sels:
+                block = RMBlock(current_block_sels)
+                blocks.append(block)
+                current_block_sels = {}
+    
+    # Don't forget the last block if session ends with RMs
+    if current_block_sels:
+        block = RMBlock(current_block_sels)
         blocks.append(block)
-
-    blocks.sort(key=lambda b: b.time)
-    return blocks
-
-
-def find_rm_blocks():
-    """
-    Detect the RM blocks (standards blocks in a standard-sample-bracketing protocol).
-
-    Returns the constructed RM blocks, or None if block detection/building fails.
-    """
-    main_anchor_sel, main_anchor_group = find_first_rm_block()
-    if main_anchor_sel is None:
-        return None
-
-    all_rm_sels = collect_all_rm_selections()
-    rm_group_names = data.selectionGroupNames(data.ReferenceMaterial)
-
-    main_rm_group = data.selectionGroup(main_anchor_group)
-    main_rm_sels = sorted(
-        list(main_rm_group.selections()),
-        key=lambda s: s.midTimestamp if not s.isLinked() else s.linkedMidTimestamp(),
-    )
-
-    blocks = construct_rm_blocks(main_rm_sels, all_rm_sels, rm_group_names)
-    if not blocks:
-        return None
-
+    
+    if blocks:
+        IoLog.information(f"Detected {len(blocks)} contiguous RM blocks.")
+    else:
+        IoLog.error("No RM blocks detected in session.")
+    
     return blocks
 
 
@@ -876,7 +766,7 @@ def runDRS():
         )
         return
 
-    IoLog.information(f"Built {len(blocks)} RM blocks from {blocks[0].main_rm_group}.")
+    IoLog.information(f"Built {len(blocks)} contiguous RM blocks.")
 
     #
     # Step 5: Fit regressions
@@ -1375,15 +1265,17 @@ def settingsWidget():
             block_data = []
             block_rm_names = []
 
-            for rm_group_name, sel in block.rm_sels.items():
+            for rm_group_name, sel_list in block.rm_sels.items():
                 # Only include RMs that are in selected_rms
                 if rm_group_name not in selected_rms:
                     continue
 
-                stats = gather_ratio_stats(target_el, ca_chan, selection=sel)
-                if stats:
-                    block_data.append(stats)
-                    block_rm_names.append(rm_group_name)
+                # Handle multiple selections per RM
+                for sel in sel_list:
+                    stats = gather_ratio_stats(target_el, ca_chan, selection=sel)
+                    if stats:
+                        block_data.append(stats)
+                        block_rm_names.append(rm_group_name)
 
             if len(block_data) < max(2, drs.setting("MinRMsPerBlock")):
                 continue
