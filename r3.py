@@ -1,10 +1,10 @@
 # Metadata
 #/ Type: DRS
-#/ Name: RM5
+#/ Name: Repeated Ratio Regressions (R3)
 #/ Authors: Thomas Arney
-#/ Description: Reduction by moving regressions of measured and reference molar ratios in matrix-matched reference materials.
+#/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
 #/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-#/ Version: 0.3
+#/ Version: 0.4
 #/ Contact: t.arney@soton.ac.uk
 
 
