@@ -645,67 +645,72 @@ def apply_secondary_normalisation(
 
 def find_rm_blocks():
     """
-    Build standard blocks by detecting contiguous runs of RMs.
-    
-    A block is a contiguous sequence of RM measurements (can be different RMs).
-    Blocks are separated by Samples.
+    Build standards blocks based on time gaps between neighbouring RM selections.
+
+    A new block starts whenever the gap to the previous RM selection is longer than
+    the mean gap across all RM selections, multiplied by a tuning factor.
+    Inspired by the "simple" detection method in the "3D Trace Elements" DRS,
+    but with a configurable cutoff.
     
     Returns: list of RMBlock objects sorted by time, or empty list if no blocks found
     """
-    all_sels = []
+    selections = []
 
     for rm_name in data.selectionGroupNames(data.ReferenceMaterial):
         sg = data.selectionGroup(rm_name)
         if sg:
             for sel in sg.selections():
                 t = sel.midTimestamp if not sel.isLinked() else sel.linkedMidTimestamp()
-                all_sels.append((t, sel, rm_name, True))
+                selections.append((t, sel, rm_name))
 
-    for sample_name in data.selectionGroupNames(data.Sample):
-        sg = data.selectionGroup(sample_name)
-        if sg:
-            for sel in sg.selections():
-                t = sel.midTimestamp if not sel.isLinked() else sel.linkedMidTimestamp()
-                all_sels.append((t, sel, sample_name, False))
-
-    all_sels.sort(key=lambda x: x[0])
-    
-    if not all_sels:
+    if not selections:
+        IoLog.error("No RM selections found in this session.")
         return []
-    
+
+    selections.sort(key=lambda x: x[0])
+    sel_mid_times = [t for t, _, _ in selections]
+
+    if len(sel_mid_times) == 1:
+        diffs = np.array([0.0])
+    else:
+        diffs = np.insert(np.diff(sel_mid_times), 0, 0.0)
+
+    sensitivity = drs.setting("BlockDetectionSensitivity")
+    if sensitivity is None:
+        sensitivity = 1.0
+
+    cutoff = (float(np.mean(diffs)) if len(diffs) else 0.0) * float(sensitivity)
+
+    labels = []
+    current_label = 1
+    for gap in diffs:
+        if gap > cutoff:
+            current_label += 1
+        labels.append(current_label)
+
     blocks = []
-    current_block_sels = {}  # {RM_name: [Selection, ...]}
-    current_block_first_time = None
-    current_block_last_time = None
-    
-    for t, sel, group_name, is_rm in all_sels:
-        if is_rm:
-            if current_block_first_time is None:
-                current_block_first_time = t
-            current_block_last_time = t
-            # Add this RM measurement to the current block
+    block_selections = {}
+
+    for label, (t, sel, group_name) in zip(labels, selections):
+        if label not in block_selections:
+            block_selections[label] = []
+        block_selections[label].append((t, sel, group_name))
+
+    for label in sorted(block_selections):
+        labeled_sels = block_selections[label]
+        first_time = labeled_sels[0][0]
+        last_time = labeled_sels[-1][0]
+        block_time = (first_time + last_time) / 2.0
+
+        current_block_sels = {}
+        for _, sel, group_name in labeled_sels:
             if group_name not in current_block_sels:
                 current_block_sels[group_name] = []
             current_block_sels[group_name].append(sel)
-        else:
-            # Sample encountered: end current block if non-empty and start fresh
-            if current_block_sels:
-                block_time = (current_block_first_time + current_block_last_time) / 2.0
-                block = RMBlock(block_time, current_block_sels)
-                blocks.append(block)
-                current_block_sels = {}
-                current_block_first_time = None
-                current_block_last_time = None
+
+        blocks.append(RMBlock(block_time, current_block_sels))
     
-    # Don't forget the last block if session ends with RMs
-    if current_block_sels:
-        block_time = (current_block_first_time + current_block_last_time) / 2.0
-        block = RMBlock(block_time, current_block_sels)
-        blocks.append(block)
-    
-    if blocks:
-        IoLog.information(f"Detected {len(blocks)} contiguous RM blocks.")
-    else:
+    if not blocks:
         IoLog.error("No RM blocks detected in session.")
     
     return blocks
@@ -954,6 +959,7 @@ def settingsWidget():
     drs.setSetting("FixMissingUnc", True)
     drs.setSetting("MissingUnc2RSD", 10.0)
     drs.setSetting("MinRMsPerBlock", 2)
+    drs.setSetting("BlockDetectionSensitivity", 1.0)
     drs.setSetting("SplineType", "StepLinear")
 
     # Initialise Elements
@@ -1770,7 +1776,29 @@ def settingsWidget():
     )
     tsrControlsLayout.addWidget(minRMsSpinBox)
 
-    tsrControlsLayout.addSpacing(30)
+    tsrControlsLayout.addSpacing(20)
+
+    # Block detection sensitivity
+    tsrControlsLayout.addWidget(QtGui.QLabel("Block detection sensitivity:"))
+    blockDetectionSensitivitySpinBox = QtGui.QDoubleSpinBox()
+    blockDetectionSensitivitySpinBox.setRange(0.1, 10.0)
+    blockDetectionSensitivitySpinBox.setSingleStep(0.1)
+    blockDetectionSensitivitySpinBox.setDecimals(2)
+    blockDetectionSensitivitySpinBox.setValue(
+        drs.setting("BlockDetectionSensitivity")
+    )
+    blockDetectionSensitivitySpinBox.setToolTip(
+        "1.0 should be fine for most sessions. Increase it to require a longer gap between blocks, or decrease it to allow shorter gaps."
+    )
+    blockDetectionSensitivitySpinBox.valueChanged.connect(
+        lambda v: (
+            drs.setSetting("BlockDetectionSensitivity", float(v)),
+            refreshPlot(),
+        )
+    )
+    tsrControlsLayout.addWidget(blockDetectionSensitivitySpinBox)
+
+    tsrControlsLayout.addSpacing(20)
 
     # Spline type
     tsrControlsLayout.addWidget(QtGui.QLabel("Spline type:"))
