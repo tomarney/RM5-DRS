@@ -73,18 +73,22 @@ class RMBlock:
     Each RM can appear multiple times within a block if measurements are contiguous.
     """
 
-    def __init__(self, rm_sels):
+    def __init__(self, time, rm_sels):
         """
         Args:
+            time: float. Midpoint time of the first and last RM in the block.
             rm_sels: dict {RM_name: [Selection, ...]}. List of selections for each RM.
         """
+        self.time = time
         self.rm_sels = rm_sels
 
     def __repr__(self):
+        if not self.rm_sels:
+            return f"RMBlock(t={self.time:.1f}s, empty)"
         rm_counts = ", ".join(
             [f"{name}({len(sels)})" for name, sels in self.rm_sels.items()]
         )
-        return f"RMBlock({rm_counts})"
+        return f"RMBlock(t={self.time:.1f}s, {rm_counts})"
 
 
 # --- Initialize Plot object ---
@@ -358,7 +362,7 @@ def drs_complete(error=False, error_message="Finished!"):
 
 
 def fit_regression_for_block(
-    block: RMBlock, el_name, ca_channel_name, selected_rms=None
+    block: RMBlock, el_name, ca_channel_name, selected_rms=None, min_rms_per_block=2
 ):
     """
     Fit single regression for the element/Ca ratio in one standards block.
@@ -374,19 +378,25 @@ def fit_regression_for_block(
     Returns: dict {slope, intercept, r_squared, slope_unc, intercept_unc} or None
     """
     rm_data = []
+    valid_rm_names = []
     
     # Iterate over all RM types and their selections in this block
     for rm_group_name, sel_list in block.rm_sels.items():
         if selected_rms is not None and rm_group_name not in selected_rms:
             continue
         
+        rm_stats = []
         # Gather stats for each selection of this RM (may be multiple)
         for sel in sel_list:
             stats = gather_ratio_stats(el_name, ca_channel_name, selection=sel)
             if stats:
-                rm_data.append(stats)
+                rm_stats.append(stats)
 
-    if len(rm_data) < 2:
+        if rm_stats:
+            valid_rm_names.append(rm_group_name)
+            rm_data.extend(rm_stats)
+
+    if len(set(valid_rm_names)) < min_rms_per_block:
         return None
 
     x, y, x_err, y_err = (np.array(vals) for vals in zip(*rm_data))
@@ -434,7 +444,7 @@ def fit_regressions_for_all_blocks(
 
         selected_rms = rm_selections.get(el_name, []) if rm_selections else None
 
-        for block in blocks:
+        for block_num, block in enumerate(blocks):
             # Count unique RM types in this block (after filtering by selected_rms if needed)
             if selected_rms is not None:
                 viable_rms = sum(1 for rm in block.rm_sels.keys() if rm in selected_rms)
@@ -449,11 +459,15 @@ def fit_regressions_for_all_blocks(
                 continue
 
             fit_result = fit_regression_for_block(
-                block, el_name, ca_channel_name, selected_rms
+                block,
+                el_name,
+                ca_channel_name,
+                selected_rms,
+                min_rms_per_block=min_rms_per_block,
             )
             if fit_result is None:
                 IoLog.warning(
-                    f"Could not fit {el_name}/Ca for block at t={block.time:.1f} s"
+                    f"Could not fit {el_name}/Ca for block {block_num}"
                 )
                 continue
 
@@ -661,9 +675,14 @@ def find_rm_blocks():
     
     blocks = []
     current_block_sels = {}  # {RM_name: [Selection, ...]}
+    current_block_first_time = None
+    current_block_last_time = None
     
     for t, sel, group_name, is_rm in all_sels:
         if is_rm:
+            if current_block_first_time is None:
+                current_block_first_time = t
+            current_block_last_time = t
             # Add this RM measurement to the current block
             if group_name not in current_block_sels:
                 current_block_sels[group_name] = []
@@ -671,13 +690,17 @@ def find_rm_blocks():
         else:
             # Sample encountered: end current block if non-empty and start fresh
             if current_block_sels:
-                block = RMBlock(current_block_sels)
+                block_time = (current_block_first_time + current_block_last_time) / 2.0
+                block = RMBlock(block_time, current_block_sels)
                 blocks.append(block)
                 current_block_sels = {}
+                current_block_first_time = None
+                current_block_last_time = None
     
     # Don't forget the last block if session ends with RMs
     if current_block_sels:
-        block = RMBlock(current_block_sels)
+        block_time = (current_block_first_time + current_block_last_time) / 2.0
+        block = RMBlock(block_time, current_block_sels)
         blocks.append(block)
     
     if blocks:
@@ -1277,7 +1300,7 @@ def settingsWidget():
                         block_data.append(stats)
                         block_rm_names.append(rm_group_name)
 
-            if len(block_data) < max(2, drs.setting("MinRMsPerBlock")):
+            if len(set(block_rm_names)) < drs.setting("MinRMsPerBlock"):
                 continue
 
             x_vals, y_vals, x_errs, y_errs = (
